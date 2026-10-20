@@ -1,9 +1,8 @@
 <?php
 // Striver – frågeformulär (steg för steg)
-// Sparar svaren i $_SESSION['questionnaire']. Ingen databas används.
-
+// Sparar svaren i sessionen och i databasen när formuläret slutförs.
 session_start();
-
+require_once __DIR__ . '/db.php';
 // ---------- Frågor och tillåtna svar ----------
 $steg_data = [
     1 => [
@@ -25,13 +24,13 @@ $steg_data = [
         'fraga'  => 'Vilken typ av träning gör du?',
         'hjalp'  => 'Välj den träningsform du fokuserar mest på.',
         'val'    => [
-            'gym'        => 'Gym',
-            'lopning'    => 'Löpning',
-            'kampsport'  => 'Kampsport',
-            'fotboll'    => 'Fotboll',
-            'basket'     => 'Basket',
-            'annan_sport'=> 'Annan sport',
-            'blandat'    => 'Blandat',
+            'gym'         => 'Gym',
+            'lopning'     => 'Löpning',
+            'kampsport'   => 'Kampsport',
+            'fotboll'     => 'Fotboll',
+            'basket'      => 'Basket',
+            'annan_sport' => 'Annan sport',
+            'blandat'     => 'Blandat',
         ],
     ],
     3 => [
@@ -82,7 +81,6 @@ $steg_data = [
     ],
 ];
 $antal_steg = count($steg_data);
-
 // ---------- Sessionsdata och CSRF-token ----------
 if (!isset($_SESSION['questionnaire']) || !is_array($_SESSION['questionnaire'])) {
     $_SESSION['questionnaire'] = [];
@@ -93,7 +91,6 @@ if (!isset($_SESSION['questionnaire_labels']) || !is_array($_SESSION['questionna
 if (empty($_SESSION['csrf'])) {
     $_SESSION['csrf'] = bin2hex(random_bytes(32));
 }
-
 // Första steget som saknar svar (så att man inte kan hoppa över steg)
 function forsta_saknade_steg(array $steg_data, array $svar): int
 {
@@ -104,15 +101,12 @@ function forsta_saknade_steg(array $steg_data, array $svar): int
     }
     return count($steg_data) + 1;
 }
-
 $fel = '';
 $steg_nr = 1;
-
 // ---------- Hantera skickat formulär ----------
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     $steg_nr = (int)($_POST['steg'] ?? 0);
     $token   = (string)($_POST['csrf'] ?? '');
-
     if (!hash_equals($_SESSION['csrf'], $token)) {
         $fel = 'Sessionen gick ut. Försök igen.';
         $steg_nr = max(1, min($antal_steg, $steg_nr));
@@ -124,30 +118,54 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         header('Location: questionnaire.php?steg=' . forsta_saknade_steg($steg_data, $_SESSION['questionnaire']));
         exit;
     } else {
-        $steg   = $steg_data[$steg_nr];
-        $svar   = (string)($_POST['svar'] ?? '');
-
+        $steg = $steg_data[$steg_nr];
+        $svar = (string)($_POST['svar'] ?? '');
         if (!array_key_exists($svar, $steg['val'])) {
             $fel = 'Välj ett alternativ för att gå vidare.';
         } else {
             $_SESSION['questionnaire'][$steg['nyckel']] = $svar;
             $_SESSION['questionnaire_labels'][$steg['nyckel']] = $steg['val'][$svar];
             $_SESSION['questionnaire_complete'] = false;
-
             if ($steg_nr < $antal_steg) {
                 header('Location: questionnaire.php?steg=' . ($steg_nr + 1));
                 exit;
             }
-
             // Sista steget: kontrollera att allt är besvarat
             if (forsta_saknade_steg($steg_data, $_SESSION['questionnaire']) > $antal_steg) {
-                session_regenerate_id(true);
-                $_SESSION['questionnaire_complete'] = true;
-                header('Location: result.php');
-                exit;
+                // Kontrollera att användaren är inloggad
+                if (empty($_SESSION['user_id'])) {
+                    header('Location: login.php');
+                    exit;
+                }
+                // Hämta svaren från sessionen
+                $svar = $_SESSION['questionnaire'];
+                try {
+                    // Förbered SQL-frågan
+                    $stmt = $pdo->prepare("
+                        INSERT INTO questionnaire_answers
+                        (user_id, goal, training_type, frequency, session_length, equipment, help_type)
+                        VALUES
+                        (:user_id, :goal, :training_type, :frequency, :session_length, :equipment, :help_type)
+                    ");
+                    // Skicka svaren till databasen
+                    $stmt->execute([
+                        ':user_id' => $_SESSION['user_id'],
+                        ':goal' => $svar['mal'],
+                        ':training_type' => $svar['traningstyp'],
+                        ':frequency' => $svar['frekvens'],
+                        ':session_length' => $svar['passlangd'],
+                        ':equipment' => $svar['utrustning'],
+                        ':help_type' => $svar['hjalp']
+                    ]);
+                    // Markera formuläret som färdigt
+                    $_SESSION['questionnaire_complete'] = true;
+                    // Skicka användaren till resultatsidan
+                    header('Location: result.php');
+                    exit;
+                } catch (PDOException $ex) {
+                    $fel = 'Kunde inte spara dina svar. Försök igen.';
+                }
             }
-            header('Location: questionnaire.php?steg=' . forsta_saknade_steg($steg_data, $_SESSION['questionnaire']));
-            exit;
         }
     }
 } else {
@@ -160,12 +178,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         exit;
     }
 }
-
-$steg    = $steg_data[$steg_nr];
-$vald    = $_SESSION['questionnaire'][$steg['nyckel']] ?? '';
+$steg = $steg_data[$steg_nr];
+$vald = $_SESSION['questionnaire'][$steg['nyckel']] ?? '';
 $procent = round($steg_nr / $antal_steg * 100);
 $ar_sista = ($steg_nr === $antal_steg);
-
 function e(string $text): string
 {
     return htmlspecialchars($text, ENT_QUOTES, 'UTF-8');
@@ -207,10 +223,9 @@ function e(string $text): string
       content: ""; position: fixed; border-radius: 50%; filter: blur(120px); pointer-events: none; z-index: 0;
     }
     body::before { width: 460px; height: 460px; background: rgba(79, 124, 255, 0.22); top: -160px; left: -140px; }
-    body::after  { width: 420px; height: 420px; background: rgba(139, 92, 246, 0.2); bottom: -160px; right: -120px; }
+    body::after { width: 420px; height: 420px; background: rgba(139, 92, 246, 0.2); bottom: -160px; right: -120px; }
     a { color: inherit; text-decoration: none; }
     :focus-visible { outline: 2px solid var(--blue); outline-offset: 3px; border-radius: 8px; }
-
     .topbar {
       position: relative; z-index: 1; display: flex; align-items: center; justify-content: space-between;
       width: min(760px, 100% - 2.5rem); margin: 0 auto; padding: 1.5rem 0;
@@ -219,17 +234,13 @@ function e(string $text): string
     .logo-mark { width: 32px; height: 32px; border-radius: 10px; background: var(--grad); display: grid; place-items: center; font-size: 1rem; color: #fff; }
     .avbryt { color: var(--muted); font-weight: 500; font-size: 0.95rem; }
     .avbryt:hover { color: var(--text); }
-
     main { position: relative; z-index: 1; flex: 1; width: min(760px, 100% - 2.5rem); margin: 0 auto; padding: 1rem 0 3rem; }
-
     .progress-text { display: flex; justify-content: space-between; color: var(--muted); font-weight: 500; font-size: 0.95rem; margin-bottom: 0.75rem; }
     .progress-text strong { color: var(--text); }
     .progress { height: 8px; border-radius: 999px; background: rgba(148, 163, 255, 0.14); overflow: hidden; }
     .progress-bar { height: 100%; width: <?= $procent ?>%; border-radius: 999px; background: var(--grad); transition: width 0.4s ease; }
-
     h1 { font: 800 clamp(1.9rem, 5vw, 2.7rem)/1.15 var(--font-head); letter-spacing: -0.03em; margin: 2.5rem 0 0.6rem; }
     .hjalp { color: var(--muted); margin: 0 0 2rem; }
-
     fieldset { border: 0; padding: 0; margin: 0; min-width: 0; }
     .options { display: grid; grid-template-columns: repeat(2, 1fr); gap: 0.9rem; }
     .option { position: relative; display: block; cursor: pointer; }
@@ -256,9 +267,7 @@ function e(string $text): string
     .option input:checked + .option-body .check { background: var(--grad); border-color: transparent; }
     .option input:checked + .option-body .check svg { opacity: 1; }
     .option input:focus-visible + .option-body { outline: 2px solid var(--blue); outline-offset: 3px; }
-
     .fel { margin: 0 0 1.25rem; padding: 0.85rem 1.1rem; border-radius: 14px; background: rgba(248, 113, 113, 0.12); border: 1px solid rgba(248, 113, 113, 0.4); color: #fecaca; font-size: 0.98rem; }
-
     .actions { display: flex; align-items: center; justify-content: space-between; gap: 1rem; margin-top: 2.5rem; }
     .btn {
       display: inline-flex; align-items: center; justify-content: center; padding: 0.95rem 1.9rem; border-radius: 999px;
@@ -270,7 +279,6 @@ function e(string $text): string
     .btn-primary:disabled { opacity: 0.4; cursor: not-allowed; box-shadow: none; }
     .btn-ghost { border-color: var(--line); background: rgba(255, 255, 255, 0.03); color: var(--text); }
     .btn-ghost:hover { background: rgba(255, 255, 255, 0.08); }
-
     @media (max-width: 600px) {
       .options { grid-template-columns: 1fr; }
       .option-body { min-height: 68px; }
@@ -281,14 +289,12 @@ function e(string $text): string
   </style>
 </head>
 <body>
-
 <div class="topbar">
   <a href="index.php" class="logo" aria-label="Striver – till startsidan">
     <span class="logo-mark" aria-hidden="true">S</span>Striver
   </a>
   <a href="index.php" class="avbryt">Avbryt</a>
 </div>
-
 <main>
   <div class="progress-text">
     <strong>Steg <?= $steg_nr ?> av <?= $antal_steg ?></strong>
@@ -297,21 +303,17 @@ function e(string $text): string
   <div class="progress" role="progressbar" aria-valuemin="1" aria-valuemax="<?= $antal_steg ?>" aria-valuenow="<?= $steg_nr ?>" aria-label="Framsteg i frågeformuläret">
     <div class="progress-bar"></div>
   </div>
-
   <form method="post" action="questionnaire.php" id="fraga-form" novalidate>
     <input type="hidden" name="steg" value="<?= $steg_nr ?>">
     <input type="hidden" name="csrf" value="<?= e($_SESSION['csrf']) ?>">
-
     <fieldset>
       <legend>
         <h1><?= e($steg['fraga']) ?></h1>
       </legend>
       <p class="hjalp"><?= e($steg['hjalp']) ?></p>
-
       <?php if ($fel !== ''): ?>
         <p class="fel" role="alert"><?= e($fel) ?></p>
       <?php endif; ?>
-
       <div class="options">
         <?php foreach ($steg['val'] as $varde => $etikett): ?>
           <label class="option">
@@ -326,7 +328,6 @@ function e(string $text): string
         <?php endforeach; ?>
       </div>
     </fieldset>
-
     <div class="actions">
       <?php if ($steg_nr > 1): ?>
         <a href="questionnaire.php?steg=<?= $steg_nr - 1 ?>" class="btn btn-ghost">Föregående</a>
@@ -339,7 +340,6 @@ function e(string $text): string
     </div>
   </form>
 </main>
-
 <script>
   // Knappen är inaktiv tills användaren har valt ett alternativ
   const knapp = document.getElementById('nasta-knapp');
